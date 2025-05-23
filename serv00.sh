@@ -9,9 +9,6 @@ green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
-#修改声明
-declare -gA ADDITIONAL_TCP_PORTS_ARRAY=() # 使用关联数组以便未来可能按标签存储，或简单索引数组
-declare -g ADDITIONAL_UDP_PORT_VAR=""    # -g 确保在函数外也可用（如果脚本选项需要）
 USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
 snb=$(hostname | cut -d. -f1)
 nb=$(hostname | cut -d '.' -f 1 | tr -d 's')
@@ -197,45 +194,164 @@ green "你的vmess-ws端口(设置Argo固定域名端口): $vmess_port"
 green "你的hysteria2端口: $hy2_port"
 }
 
-install_singbox() {
-if [[ -e $WORKDIR/list.txt ]]; then
-yellow "已安装sing-box，请先选择2卸载，再执行安装" && exit
-fi
-sleep 2
-        cd $WORKDIR
-	echo
-	read_ip
- 	echo
-        read_reym
-	echo
-	read_uuid
-        echo
-        check_port
-	echo
-        sleep 2
-        argo_configure
-	echo
-        download_and_run_singbox
-	cd
-        fastrun
-	green "创建快捷方式：sb"
-	echo
-        if [ "$hona" = "serv00" ]; then
-	servkeep
-        fi
-        cd $WORKDIR
-        echo
-        get_links
-	cd
-        purple "************************************************************"
-        purple "Serv00/Hostuno-sb-yg脚本安装结束"
-	purple "退出SSH"
-	purple "请再次连接SSH，查看主菜单，请输入快捷方式：sb"
-	purple "************************************************************"
-        sleep 2
-        kill -9 $(ps -o ppid= -p $$) >/dev/null 2>&1
-}
+# 在 serv00.sh 脚本中定义其他函数的地方，加入以下函数定义：
 
+# --- 函数定义开始: open_additional_service_ports ---
+# 声明全局数组和变量来存储新端口号
+declare -gA ADDITIONAL_TCP_PORTS_ARRAY=() # 使用关联数组以便未来可能按标签存储，或简单索引数组
+declare -g ADDITIONAL_UDP_PORT_VAR=""    # -g 确保在函数外也可用（如果脚本选项需要）
+
+open_additional_service_ports() {
+    local max_managed_ports_by_script=10 # 脚本尝试管理的总端口数上限（基础+额外），给用户预留空间。可调整。
+                                         # 比如基础3个，额外3个，就是6个。若设为10，则还有4个随机添加空间。
+                                         # Serv00 通常限制15-20个总端口。设为10-12比较安全。
+    
+    local current_open_ports_count=$(devil port list | sed '1d' | wc -l) # 获取当前已开启端口总数 (除去表头)
+    
+    local target_extra_tcp_count=2 # 我们希望额外添加的TCP端口数量
+    local target_extra_udp_count=1 # 我们希望额外添加的UDP端口数量
+    
+    local added_tcp_count=0
+    local added_udp_count=0
+    local attempts_per_port_type=10 # 每种类型端口最多尝试次数，避免无限循环
+
+    # 清空上次运行时可能留下的数据 (如果脚本不是一次性执行后退出的话)
+    ADDITIONAL_TCP_PORTS_ARRAY=()
+    ADDITIONAL_UDP_PORT_VAR=""
+
+    purple "准备尝试添加额外的服务端口..."
+    purple "脚本计划管理端口上限: $max_managed_ports_by_script, 当前已开启: $current_open_ports_count"
+    purple "计划额外添加TCP端口: $target_extra_tcp_count, UDP端口: $target_extra_udp_count"
+
+    # 添加额外的TCP端口
+    local current_tcp_attempts=0
+    while [[ $added_tcp_count -lt $target_extra_tcp_count && $current_open_ports_count -lt $max_managed_ports_by_script && $current_tcp_attempts -lt $attempts_per_port_type ]]; do
+        current_tcp_attempts=$((current_tcp_attempts + 1))
+        local new_tcp_port=$(shuf -i 10000-65535 -n 1)
+
+        # 简单检查是否与已知的基础端口冲突
+        if [[ "$new_tcp_port" == "$vless_port" || "$new_tcp_port" == "$vmess_port" ]]; then
+            yellow "尝试的TCP端口 $new_tcp_port 与基础端口冲突，重新选择..."
+            continue
+        fi
+        # 也可以检查是否已存在于 ADDITIONAL_TCP_PORTS_ARRAY 中避免重复添加同一个刚成功的端口
+        # (对于随机端口，重复概率低，但严谨来说可以检查)
+
+        purple "尝试添加TCP端口: $new_tcp_port (尝试次数: $current_tcp_attempts/$attempts_per_port_type)"
+        local result=$(devil port add tcp "$new_tcp_port" 2>&1)
+
+        if [[ "$result" == *"succesfully added"* ]]; then # 注意 "succesfully added" 是 devil 命令的特定输出
+            green "成功添加额外TCP端口: $new_tcp_port"
+            ADDITIONAL_TCP_PORTS_ARRAY+=("$new_tcp_port")
+            added_tcp_count=$((added_tcp_count + 1))
+            current_open_ports_count=$((current_open_ports_count + 1))
+        elif [[ "$result" == *"already exists"* ]]; then
+            yellow "TCP端口 $new_tcp_port 已存在，尝试其他端口..."
+            # 如果端口已存在，我们不将其视为本次脚本新添加的端口，而是尝试找一个全新的。
+        else
+            red "TCP端口 $new_tcp_port 添加失败 (原因: $result)，尝试其他端口..."
+        fi
+        sleep 0.5 # 短暂休眠避免过于频繁的API调用
+    done
+
+    # 添加额外的UDP端口
+    local current_udp_attempts=0
+    if [[ -z "$ADDITIONAL_UDP_PORT_VAR" ]]; then # 仅在还未成功添加额外UDP端口时尝试
+        while [[ $added_udp_count -lt $target_extra_udp_count && $current_open_ports_count -lt $max_managed_ports_by_script && $current_udp_attempts -lt $attempts_per_port_type ]]; do
+            current_udp_attempts=$((current_udp_attempts + 1))
+            local new_udp_port=$(shuf -i 10000-65535 -n 1)
+
+            if [[ "$new_udp_port" == "$hy2_port" ]]; then
+                yellow "尝试的UDP端口 $new_udp_port 与基础端口冲突，重新选择..."
+                continue
+            fi
+
+            purple "尝试添加UDP端口: $new_udp_port (尝试次数: $current_udp_attempts/$attempts_per_port_type)"
+            local result=$(devil port add udp "$new_udp_port" 2>&1)
+
+            if [[ "$result" == *"succesfully added"* ]]; then
+                green "成功添加额外UDP端口: $new_udp_port"
+                ADDITIONAL_UDP_PORT_VAR="$new_udp_port"
+                added_udp_count=$((added_udp_count + 1))
+                current_open_ports_count=$((current_open_ports_count + 1))
+                # break # 成功添加一个UDP就退出循环 (因为我们只需要一个)
+            elif [[ "$result" == *"already exists"* ]]; then
+                yellow "UDP端口 $new_udp_port 已存在，尝试其他端口..."
+            else
+                red "UDP端口 $new_udp_port 添加失败 (原因: $result)，尝试其他端口..."
+            fi
+            sleep 0.5
+        done
+    fi
+
+
+    echo # 空行美化输出
+    if [[ ${#ADDITIONAL_TCP_PORTS_ARRAY[@]} -gt 0 ]]; then
+        green "本次运行成功开启的【额外TCP端口】有 ${#ADDITIONAL_TCP_PORTS_ARRAY[@]} 个: ${ADDITIONAL_TCP_PORTS_ARRAY[*]}"
+    else
+        yellow "本次运行未能按计划开启所有额外的TCP端口。"
+    fi
+
+    if [[ -n "$ADDITIONAL_UDP_PORT_VAR" ]]; then
+        green "本次运行成功开启的【额外UDP端口】为: $ADDITIONAL_UDP_PORT_VAR"
+    else
+        yellow "本次运行未能成功开启额外的UDP端口。"
+    fi
+    purple "额外服务端口添加尝试完成。"
+    echo # 空行美化输出
+}
+# --- 函数定义结束 ---
+
+install_singbox() {
+    if [[ -e $WORKDIR/list.txt ]]; then # 检查是否已安装
+        yellow "已安装sing-box，请先选择2卸载，再执行安装" && exit
+    fi
+    sleep 2
+    cd $WORKDIR
+    echo
+    read_ip         # 读取 IP
+    echo
+    read_reym       # 读取 Reality 域名
+    echo
+    read_uuid       # 读取 UUID
+    echo
+    check_port      # 调用原有的 check_port 函数
+    echo
+
+    # --- 从这里开始插入我们对新函数的调用 ---
+    if [[ -z "$vless_port" || -z "$vmess_port" || -z "$hy2_port" ]]; then
+        red "错误：基础端口未能成功设置，无法继续添加额外端口。"
+        red "请检查 Serv00 账户的端口状态或 check_port 函数的日志。"
+        # 此处可以考虑是否需要退出脚本，例如使用 exit 1
+    else
+        # 基础端口设置成功，现在调用新函数来添加额外端口
+        open_additional_service_ports
+    fi
+    # --- 我们对新函数的调用插入结束 ---
+
+    sleep 2         # 原有的 sleep
+    argo_configure  # 配置 Argo 隧道
+    echo
+    download_and_run_singbox # 下载、运行 sing-box (config.json 很可能在这里生成)
+    cd
+    fastrun         # 创建快捷方式 'sb'
+    green "创建快捷方式：sb"
+    echo
+    if [ "$hona" = "serv00" ]; then
+        servkeep
+    fi
+    cd $WORKDIR
+    echo
+    get_links # 获取分享链接 (我们以后也需要修改这里以包含新端口的链接)
+    cd
+    purple "************************************************************"
+    purple "Serv00/Hostuno-sb-yg脚本安装结束"
+    purple "退出SSH"
+    purple "请再次连接SSH，查看主菜单，请输入快捷方式：sb"
+    purple "************************************************************"
+    sleep 2
+    kill -9 $(ps -o ppid= -p $$) >/dev/null 2>&1
+}
 uninstall_singbox() {
   reading "\n确定要卸载吗？【y/n】: " choice
     case "$choice" in
@@ -544,6 +660,104 @@ else
 EOF
 fi
 
+# ... (前面是下载、密钥生成、cat > config.json <<EOF 主体部分)
+
+    # ... 主体EOF结束 ...
+
+    if [[ "$nb" =~ 14|15 ]]; then
+        cat >> config.json <<EOF
+            # ... "rules" ...
+            "final": "direct"
+        } # route object closed
+    } # config.json object closed
+    EOF
+    else
+        cat >> config.json <<EOF
+            "final": "direct"
+        } # route object closed
+    } # config.json object closed
+    EOF
+    fi # <--- config.json 在这里完全生成完毕
+
+    # --- 从这里开始植入我们的 jq 修改代码 ---
+    # 在此确保 $UUID, $reym, $private_key, ADDITIONAL_TCP_PORTS_ARRAY, ADDITIONAL_UDP_PORT_VAR 变量可用
+    # (它们应该从 install_singbox 和 open_additional_service_ports 函数中作为全局变量传递下来)
+
+    # 1. 为额外的TCP端口添加VLESS-Reality入口
+    if [ ${#ADDITIONAL_TCP_PORTS_ARRAY[@]} -gt 0 ]; then
+        purple "为额外的TCP端口配置VLESS-Reality服务..."
+        for PERSONAL_PORT in "${ADDITIONAL_TCP_PORTS_ARRAY[@]}"; do
+            if [[ -n "$PERSONAL_PORT" ]] && [[ "$PERSONAL_PORT" =~ ^[0-9]+$ ]]; then
+                # 构建新的 VLESS inbound JSON 对象字符串
+                new_vless_inbound_json=$(cat <<EOF_VLESS_INBOUND_INNER
+{
+    "tag": "vless-reality-personal-${PERSONAL_PORT}",
+    "type": "vless",
+    "listen": "::",
+    "listen_port": ${PERSONAL_PORT},
+    "users": [{"uuid": "${UUID}", "flow": "xtls-rprx-vision"}],
+    "tls": {
+        "enabled": true,
+        "server_name": "${reym}",
+        "reality": {
+            "enabled": true,
+            "handshake": {"server": "${reym}", "server_port": 443},
+            "private_key": "${private_key}",
+            "short_id": [""]
+        }
+    }
+}
+EOF_VLESS_INBOUND_INNER
+)
+                # 使用 jq 添加新的 inbound 对象 (假设 config.json 在当前目录)
+                jq --argjson new_obj "$new_vless_inbound_json" '.inbounds += [$new_obj]' config.json > config.json.tmp && mv config.json.tmp config.json
+                if [ $? -eq 0 ]; then
+                    green "VLESS-Reality服务已为TCP端口 $PERSONAL_PORT 配置。"
+                else
+                    red "错误: 为TCP端口 $PERSONAL_PORT 配置VLESS-Reality服务失败。jq退出码: $?"
+                    # 可以考虑输出 jq 的错误信息 cat config.json.tmp
+                fi
+            fi
+        done
+    fi
+
+    # 2. 为额外的UDP端口添加Hysteria2入口
+    if [[ -n "$ADDITIONAL_UDP_PORT_VAR" ]] && [[ "$ADDITIONAL_UDP_PORT_VAR" =~ ^[0-9]+$ ]]; then
+        purple "为额外的UDP端口 $ADDITIONAL_UDP_PORT_VAR 配置Hysteria2服务..."
+        new_hy2_inbound_json=$(cat <<EOF_HY2_INBOUND_INNER
+{
+    "tag": "hysteria-in-extra-${ADDITIONAL_UDP_PORT_VAR}",
+    "type": "hysteria2",
+    "listen": "::", 
+    "listen_port": ${ADDITIONAL_UDP_PORT_VAR},
+    "users": [{"password": "${UUID}"}],
+    "masquerade": "https://www.bing.com",
+    "ignore_client_bandwidth": false,
+    "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "cert.pem", 
+        "key_path": "private.key"
+    }
+}
+EOF_HY2_INBOUND_INNER
+)
+        jq --argjson new_obj "$new_hy2_inbound_json" '.inbounds += [$new_obj]' config.json > config.json.tmp && mv config.json.tmp config.json
+        if [ $? -eq 0 ]; then
+            green "Hysteria2服务已为UDP端口 $ADDITIONAL_UDP_PORT_VAR 配置。"
+        else
+            red "错误: 为UDP端口 $ADDITIONAL_UDP_PORT_VAR 配置Hysteria2服务失败。jq退出码: $?"
+        fi
+    fi
+    # --- jq 修改代码植入结束 ---
+
+
+    # 接下来是脚本中原有的启动 sing-box 主进程的逻辑
+    if ! ps aux | grep '[r]un -c con' > /dev/null; then
+        ps aux | grep '[r]un -c con' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
+        # ... (后续的 nohup 启动命令)
+    # ...
+
 if ! ps aux | grep '[r]un -c con' > /dev/null; then
 ps aux | grep '[r]un -c con' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
 if [ -e "$(basename "${FILE_MAP[web]}")" ]; then
@@ -706,10 +920,62 @@ hy2_link1="hysteria2://$UUID@$CIP1:$hy2_port?security=tls&sni=www.bing.com&alpn=
 echo "$hy2_link1" >> jh.txt
 vl_link2="vless://$UUID@$CIP2:$vless_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reym&fp=chrome&pbk=$public_key&type=tcp&headerType=none#$snb-reality-$USERNAME-$CIP2"
 echo "$vl_link2" >> jh.txt
+
+# --- 从这里开始为新增的 VLESS-Reality TCP 端口生成链接 ---
+if [ ${#ADDITIONAL_TCP_PORTS_ARRAY[@]} -gt 0 ]; then
+    purple "为新增的个人VLESS-Reality TCP端口生成链接..."
+    # 确保 $UUID, $IP, $CIP1, $CIP2, $reym, $public_key, $snb, $USERNAME 在此作用域可用
+    for PERSONAL_TCP_PORT in "${ADDITIONAL_TCP_PORTS_ARRAY[@]}"; do
+        if [[ -n "$PERSONAL_TCP_PORT" ]]; then
+            local vl_personal_link="vless://${UUID}@${IP}:${PERSONAL_TCP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${public_key}&type=tcp&headerType=none#${snb}-reality-personal-${USERNAME}-${PERSONAL_TCP_PORT}"
+            echo "$vl_personal_link" >> jh.txt
+            purple "  VLESS Reality (额外TCP端口: $PERSONAL_TCP_PORT, IP: $IP): $vl_personal_link"
+
+            if [[ -n "$CIP1" ]]; then
+                local vl_personal_link1="vless://${UUID}@${CIP1}:${PERSONAL_TCP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${public_key}&type=tcp&headerType=none#${snb}-reality-personal-${USERNAME}-${CIP1}-${PERSONAL_TCP_PORT}"
+                echo "$vl_personal_link1" >> jh.txt
+                purple "  VLESS Reality (额外TCP端口: $PERSONAL_TCP_PORT, IP: $CIP1): $vl_personal_link1"
+            fi
+
+            if [[ -n "$CIP2" ]]; then
+                local vl_personal_link2="vless://${UUID}@${CIP2}:${PERSONAL_TCP_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${public_key}&type=tcp&headerType=none#${snb}-reality-personal-${USERNAME}-${CIP2}-${PERSONAL_TCP_PORT}"
+                echo "$vl_personal_link2" >> jh.txt
+                purple "  VLESS Reality (额外TCP端口: $PERSONAL_TCP_PORT, IP: $CIP2): $vl_personal_link2"
+            fi
+            echo # 空行美化输出
+        fi
+    done
+fi
+# --- 新增的 VLESS-Reality TCP 端口链接生成结束 ---
+
 vmws_link2="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"$snb-vmess-ws-$USERNAME-$CIP2\", \"add\": \"$CIP2\", \"port\": \"$vmess_port\", \"id\": \"$UUID\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"\", \"path\": \"/$UUID-vm?ed=2048\", \"tls\": \"\", \"sni\": \"\", \"alpn\": \"\", \"fp\": \"\"}" | base64 -w0)"
 echo "$vmws_link2" >> jh.txt
 hy2_link2="hysteria2://$UUID@$CIP2:$hy2_port?security=tls&sni=www.bing.com&alpn=h3&insecure=1#$snb-hy2-$USERNAME-$CIP2"
 echo "$hy2_link2" >> jh.txt
+
+# --- 从这里开始为新增的 Hysteria2 UDP 端口生成链接 ---
+if [[ -n "$ADDITIONAL_UDP_PORT_VAR" ]]; then
+    purple "为新增的Hysteria2 UDP端口 ${ADDITIONAL_UDP_PORT_VAR} 生成链接..."
+    # 确保 $UUID, $IP, $CIP1, $CIP2, $snb, $USERNAME 在此作用域可用
+    # Hysteria2 的 SNI 在原脚本中是 www.bing.com, insecure=1。我们保持一致。
+    local hy2_extra_link="hysteria2://${UUID}@${IP}:${ADDITIONAL_UDP_PORT_VAR}?security=tls&sni=www.bing.com&alpn=h3&insecure=1#${snb}-hy2-extra-${USERNAME}-${ADDITIONAL_UDP_PORT_VAR}"
+    echo "$hy2_extra_link" >> jh.txt
+    purple "  Hysteria2 (额外UDP端口: $ADDITIONAL_UDP_PORT_VAR, IP: $IP): $hy2_extra_link"
+
+    if [[ -n "$CIP1" ]]; then
+        local hy2_extra_link1="hysteria2://${UUID}@${CIP1}:${ADDITIONAL_UDP_PORT_VAR}?security=tls&sni=www.bing.com&alpn=h3&insecure=1#${snb}-hy2-extra-${USERNAME}-${CIP1}-${ADDITIONAL_UDP_PORT_VAR}"
+        echo "$hy2_extra_link1" >> jh.txt
+        purple "  Hysteria2 (额外UDP端口: $ADDITIONAL_UDP_PORT_VAR, IP: $CIP1): $hy2_extra_link1"
+    fi
+
+    if [[ -n "$CIP2" ]]; then
+        local hy2_extra_link2="hysteria2://${UUID}@${CIP2}:${ADDITIONAL_UDP_PORT_VAR}?security=tls&sni=www.bing.com&alpn=h3&insecure=1#${snb}-hy2-extra-${USERNAME}-${CIP2}-${ADDITIONAL_UDP_PORT_VAR}"
+        echo "$hy2_extra_link2" >> jh.txt
+        purple "  Hysteria2 (额外UDP端口: $ADDITIONAL_UDP_PORT_VAR, IP: $CIP2): $hy2_extra_link2"
+    fi
+    echo # 空行美化输出
+fi
+# --- 新增的 Hysteria2 UDP 端口链接生成结束 ---
 
 argosl=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
 checkhttp1=$(curl -o /dev/null -s -w "%{http_code}\n" "https://$argosl")
