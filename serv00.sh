@@ -9,6 +9,9 @@ green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
+#修改声明
+declare -gA ADDITIONAL_TCP_PORTS_ARRAY=() # 使用关联数组以便未来可能按标签存储，或简单索引数组
+declare -g ADDITIONAL_UDP_PORT_VAR=""    # -g 确保在函数外也可用（如果脚本选项需要）
 USERNAME=$(whoami | tr '[:upper:]' '[:lower:]')
 snb=$(hostname | cut -d. -f1)
 nb=$(hostname | cut -d '.' -f 1 | tr -d 's')
